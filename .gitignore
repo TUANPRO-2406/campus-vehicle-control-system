@@ -1,0 +1,55 @@
+# ==========================================
+# 1. PYTHON & VIRTUAL ENVIRONMENT
+# ==========================================
+venv/
+.venv/
+env/
+bin/
+lib/
+# Các file bytecode của Python
+__pycache__/
+*.py[cod]
+*$py.class
+# File cấu hình biến môi trường (Chứa mật khẩu, API key)
+.env
+
+# ==========================================
+# 2. VUEJS & FRONTEND
+# ==========================================
+node_modules/
+dist/
+# Log của npm/yarn
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+# File môi trường của Vue
+.env.local
+.env.*.local
+
+# ==========================================
+# 3. AI, DATA & DATABASE
+# ==========================================
+# Database SQLite (Nên chặn để mỗi máy tự khởi tạo db sạch)
+*.db
+*.sqlite3
+parking_v2.db
+
+# Kết quả xử lý AI (Ảnh cắt biển số, video output)
+public/images/
+public/images/*.jpg
+public/images/*.png
+# Chặn các file video demo nếu chúng quá nặng (>100MB)
+public/*.mp4
+*.mp4
+
+# Cache của các model AI
+.cache/
+.ipynb_checkpoints/
+
+# ==========================================
+# 4. IDE & SYSTEM (Quan trọng để repo sạch)
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
