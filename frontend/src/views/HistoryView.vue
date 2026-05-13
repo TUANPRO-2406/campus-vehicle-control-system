@@ -6,12 +6,25 @@
         <p class="subtitle">Xem lại lịch sử và khắc phục các trường hợp AI đọc sai biển số</p>
       </div>
       <div class="filter-actions">
-        <input type="date" class="input-field date-picker" />
-        <select class="input-field status-select" v-model="filterStatus">
+        <input 
+          type="text" 
+          class="input-field" 
+          placeholder="Tìm biển số..."
+          v-model="filterPlate"
+          @input="currentPage = 1"
+        />
+        <input 
+          type="date" 
+          class="input-field date-picker" 
+          v-model="filterDate"
+          @change="currentPage = 1"
+        />
+        <select class="input-field status-select" v-model="filterStatus" @change="currentPage = 1">
           <option value="all">Tất cả trạng thái</option>
-          <option value="error">Cần sửa lỗi</option>
+          <option value="error">Cần sửa</option>
+          <option value="ok">Hợp lệ</option>
         </select>
-        <button class="btn btn-primary" @click="fetchLogs">Làm mới</button>
+        <button class="btn btn-primary" @click="fetchHistoryData">Làm mới</button>
       </div>
     </header>
 
@@ -74,6 +87,12 @@
           </tr>
         </tbody>
       </table>
+      
+      <div style="display: flex; justify-content: center; align-items: center; gap: 1rem; margin-top: 1rem; padding: 1rem;">
+        <button @click="prevPage" :disabled="currentPage === 1" class="btn btn-outline">← Trước</button>
+        <span>Trang {{ currentPage }} / {{ totalPages }}</span>
+        <button @click="nextPage" :disabled="currentPage === totalPages" class="btn btn-outline">Tiếp →</button>
+      </div>
     </div>
 
     <!-- Image Modal -->
@@ -91,17 +110,28 @@ import { ref, computed, onMounted } from 'vue'
 
 const logs = ref([])
 const filterStatus = ref('all')
+const filterPlate = ref('')
+const filterDate = ref('')
+const currentPage = ref(1)
+const totalPages = ref(1)
 
 const editId = ref(null)
 const editPlate = ref('')
 const showModal = ref(false)
 const modalImage = ref('')
 
-const fetchLogs = async () => {
+const fetchHistoryData = async () => {
   try {
-    const res = await fetch('http://localhost:8000/api/logs')
+    const params = new URLSearchParams({
+      page: currentPage.value,
+      limit: 20,
+      plate: filterPlate.value
+    })
+    const res = await fetch(`http://localhost:8000/api/history?${params}`)
     if (res.ok) {
-      logs.value = await res.json()
+      const data = await res.json()
+      logs.value = data.data
+      totalPages.value = data.pages
     }
   } catch (e) {
     console.error(e)
@@ -109,14 +139,26 @@ const fetchLogs = async () => {
 }
 
 onMounted(() => {
-  fetchLogs()
+  fetchHistoryData()
 })
 
 const filteredLogs = computed(() => {
+  let filtered = logs.value
+  
   if (filterStatus.value === 'error') {
-    return logs.value.filter(l => l.status !== 'HOP_LE')
+    filtered = filtered.filter(l => l.status !== 'HOP_LE')
+  } else if (filterStatus.value === 'ok') {
+    filtered = filtered.filter(l => l.status === 'HOP_LE')
   }
-  return logs.value
+  
+  if (filterDate.value) {
+    filtered = filtered.filter(l => {
+      if (!l.time_in) return false
+      return l.time_in.split('T')[0] === filterDate.value
+    })
+  }
+  
+  return filtered
 })
 
 const formatDate = (dateStr) => {
@@ -157,6 +199,20 @@ const viewImage = (url) => {
   if (!url) return
   modalImage.value = url
   showModal.value = true
+}
+
+const nextPage = () => {
+  if (currentPage.value < totalPages.value) {
+    currentPage.value++
+    fetchHistoryData()
+  }
+}
+
+const prevPage = () => {
+  if (currentPage.value > 1) {
+    currentPage.value--
+    fetchHistoryData()
+  }
 }
 </script>
 

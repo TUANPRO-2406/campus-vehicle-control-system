@@ -60,46 +60,16 @@
       <div class="charts-grid">
         <div class="chart-panel glass-panel">
           <div class="panel-header">
-            <h3>Lưu lượng theo giờ</h3>
+            <h3>Xe theo loại</h3>
           </div>
-          <div class="chart-container">
-            <!-- Mock Chart visualization -->
-            <div class="bar-chart">
-              <div v-for="i in 12" :key="i" class="bar-wrapper">
-                <div class="bar-value" :style="{ height: `${Math.max(20, Math.random() * 100)}%` }"></div>
-                <div class="bar-label">{{ i + 6 }}h</div>
-              </div>
-            </div>
-          </div>
+          <canvas ref="typeChartCanvas" style="max-height: 300px;"></canvas>
         </div>
         
         <div class="chart-panel glass-panel">
           <div class="panel-header">
-            <h3>Giờ cao điểm</h3>
+            <h3>Lưu lượng theo cổng</h3>
           </div>
-          <div class="peak-hours">
-            <div class="peak-item">
-              <div class="time-range">07:00 - 08:30</div>
-              <div class="peak-bar-container">
-                <div class="peak-bar" style="width: 95%"></div>
-              </div>
-              <div class="peak-value">Rất đông</div>
-            </div>
-            <div class="peak-item">
-              <div class="time-range">11:30 - 13:00</div>
-              <div class="peak-bar-container">
-                <div class="peak-bar" style="width: 65%"></div>
-              </div>
-              <div class="peak-value">Đông</div>
-            </div>
-            <div class="peak-item">
-              <div class="time-range">17:00 - 18:30</div>
-              <div class="peak-bar-container">
-                <div class="peak-bar" style="width: 85%"></div>
-              </div>
-              <div class="peak-value">Rất đông</div>
-            </div>
-          </div>
+          <canvas ref="gateChartCanvas" style="max-height: 300px;"></canvas>
         </div>
       </div>
     </template>
@@ -111,18 +81,90 @@ import { ref, onMounted } from 'vue'
 
 const stats = ref({})
 const isLoading = ref(true)
+const typeChartCanvas = ref(null)
+const gateChartCanvas = ref(null)
+let typeChart = null
+let gateChart = null
 
 const fetchStats = async () => {
   isLoading.value = true
   try {
+    // SỬA LỖI ĐƯỜNG DẪN: /api/statistics thành /api/stats
     const res = await fetch('http://localhost:8000/api/stats')
     if (res.ok) {
-      stats.value = await res.json()
+      const data = await res.json()
+      // SỬA LỖI MAPPING BIẾN: Lấy đúng key từ main.py trả về
+      stats.value = {
+        vehicles_in_parking: data.vehicles_inside || 0,
+        total_in: data.in_today || 0,
+        total_out: data.total_out || 0,
+        pending_errors: data.pending_errors || 0
+      }
+      initCharts(data)
     }
   } catch (err) {
     console.error("Error fetching stats:", err)
   } finally {
     isLoading.value = false
+  }
+}
+
+const initCharts = (data) => {
+  const Chart = window.Chart
+  if (!Chart) return
+  
+  // Biểu đồ cột - Xe theo loại
+  if (typeChartCanvas.value) {
+    const typeCtx = typeChartCanvas.value.getContext('2d')
+    const typeLabels = Object.keys(data.by_type || {})
+    const typeData = Object.values(data.by_type || {})
+    
+    if (typeChart) typeChart.destroy()
+    typeChart = new Chart(typeCtx, {
+      type: 'bar',
+      data: {
+        labels: typeLabels.length ? typeLabels : ['Chưa có dữ liệu'],
+        datasets: [{
+          label: 'Số lượng xe',
+          data: typeData.length ? typeData : [0],
+          backgroundColor: ['#3b82f6', '#f97316', '#10b981'],
+          borderRadius: 6
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.1)' } },
+          x: { grid: { display: false } }
+        }
+      }
+    })
+  }
+  
+  // Biểu đồ tròn - Xe theo cổng
+  if (gateChartCanvas.value) {
+    const gateCtx = gateChartCanvas.value.getContext('2d')
+    const gateLabels = Object.keys(data.by_gate || {})
+    const gateData = Object.values(data.by_gate || {})
+    
+    if (gateChart) gateChart.destroy()
+    gateChart = new Chart(gateCtx, {
+      type: 'doughnut',
+      data: {
+        labels: gateLabels.length ? gateLabels : ['Chưa có dữ liệu'],
+        datasets: [{
+          data: gateData.length ? gateData : [1],
+          backgroundColor: ['#3b82f6', '#ef4444', '#10b981']
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: { legend: { position: 'bottom' } }
+      }
+    })
   }
 }
 

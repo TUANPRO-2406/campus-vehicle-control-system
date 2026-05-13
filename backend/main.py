@@ -1,107 +1,160 @@
-import cv2
-import asyncio
-import time
-from datetime import datetime
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, func, extract
-from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
-from pydantic import BaseModel
-from typing import List, Optional
-import uvicorn
-import threading
-import queue
-import numpy as np
-from collections import Counter
-from ultralytics import YOLO
-from paddleocr import PaddleOCR
-import re
-import torch
+"""
+main.py — Server Trung Tâm (Central Server)
+============================================
+Chịu trách nhiệm:
+  - Nhận dữ liệu từ edge_client qua WebSocket /ws/camera
+  - Lưu thông tin vào/ra vào SQLite database
+  - Broadcast sự kiện real-time tới Dashboard qua /ws/live_events
+  - Cung cấp REST API cho Dashboard (auth, logs, stats, fix)
+  - KHÔNG chứa bất kỳ logic AI (YOLO/OCR) nào
+
+Chạy: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+"""
+
 import os
 import uuid
+import base64
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import List, Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, func
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 # ==========================================
 # 1. CẤU HÌNH DATABASE
 # ==========================================
-os.makedirs("public/images", exist_ok=True)
-SQLALCHEMY_DATABASE_URL = "sqlite:///./parking_v2.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.makedirs(os.path.join(BASE_DIR, "public", "images"), exist_ok=True)
+
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'parking.db')}"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Lấy đường dẫn thư mục hiện tại của file main.py
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ==========================================
+# 2. ORM MODELS
+# ==========================================
 
 class NhanVien(Base):
     __tablename__ = "nhan_vien"
     MaNhanVien = Column(Integer, primary_key=True, index=True)
-    HoTen = Column(String)
-    ChucVu = Column(String)
-    NoiCongTac = Column(String)
-    TrangThai = Column(String)
+    HoTen      = Column(String)
+    ChucVu     = Column(String)
+    NoiCongTac = Column(String, nullable=True)
+    TrangThai  = Column(String)
 
 class QuyenHan(Base):
     __tablename__ = "quyen_han"
     MaQuyenHan = Column(Integer, primary_key=True, index=True)
-    Quyen = Column(String)
+    Quyen      = Column(String, unique=True)
 
 class TaiKhoan(Base):
     __tablename__ = "tai_khoan"
     MaTaiKhoan = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    pass_ = Column("pass", String)
+    username   = Column(String, unique=True, index=True)
+    pass_      = Column("pass", String)
     MaQuyenHan = Column(Integer, ForeignKey("quyen_han.MaQuyenHan"))
     MaNhanVien = Column(Integer, ForeignKey("nhan_vien.MaNhanVien"))
 
 class LoaiPhuongTien(Base):
     __tablename__ = "loai_phuong_tien"
     MaLoaiPhuongTien = Column(Integer, primary_key=True, index=True)
-    LoaiPhuongTien = Column(String)
+    LoaiPhuongTien   = Column(String)
 
 class PhuongTien(Base):
     __tablename__ = "phuong_tien"
-    MaPhuongTien = Column(Integer, primary_key=True, index=True)
+    MaPhuongTien     = Column(Integer, primary_key=True, index=True)
     MaLoaiPhuongTien = Column(Integer, ForeignKey("loai_phuong_tien.MaLoaiPhuongTien"))
-    BienSoXe = Column(String, unique=True, index=True)
-    MaNhanVien = Column(Integer, ForeignKey("nhan_vien.MaNhanVien"), nullable=True)
+    BienSoXe         = Column(String, unique=True, index=True)
+    MaNhanVien       = Column(Integer, ForeignKey("nhan_vien.MaNhanVien"), nullable=True)
 
 class Cong(Base):
     __tablename__ = "cong"
-    MaCong = Column(Integer, primary_key=True, index=True)
+    MaCong  = Column(Integer, primary_key=True, index=True)
     TenCong = Column(String)
 
 class Camera(Base):
     __tablename__ = "camera"
-    MaCamera = Column(Integer, primary_key=True, index=True)
-    TenCamera = Column(String)
-    MaCong = Column(Integer, ForeignKey("cong.MaCong"))
-    TenHuongDi = Column(String)
+    MaCamera    = Column(Integer, primary_key=True, index=True)
+    TenCamera   = Column(String)
+    MaCong      = Column(Integer, ForeignKey("cong.MaCong"))
+    TenHuongDi  = Column(String)  # 'IN' hoặc 'OUT'
 
 class ThongTinVaoRa(Base):
     __tablename__ = "thong_tin_vao_ra"
-    MaLuotVaoRa = Column(Integer, primary_key=True, index=True)
-    MaLoaiPhuongTien = Column(Integer, ForeignKey("loai_phuong_tien.MaLoaiPhuongTien"), nullable=True)
-    BienSoXe = Column(String, index=True)
-    ThoiGianVao = Column(DateTime, nullable=True)
-    HinhAnhVao = Column(String, nullable=True)
-    ThoiGianRa = Column(DateTime, nullable=True)
-    HinhAnhRa = Column(String, nullable=True)
-    MaCamera = Column(Integer, ForeignKey("camera.MaCamera"), nullable=True)
-    TrangThai = Column(String)
+    MaLuotVaoRa     = Column(Integer, primary_key=True, index=True)
+    MaLoaiPhuongTien= Column(Integer, ForeignKey("loai_phuong_tien.MaLoaiPhuongTien"), nullable=True)
+    BienSoXe        = Column(String, index=True)
+    ThoiGianVao     = Column(DateTime, nullable=True)
+    HinhAnhVao      = Column(String, nullable=True)
+    ThoiGianRa      = Column(DateTime, nullable=True)
+    HinhAnhRa       = Column(String, nullable=True)
+    MaCamera        = Column(Integer, ForeignKey("camera.MaCamera"), nullable=True)
+    TrangThai       = Column(String)
 
 class SuCo(Base):
     __tablename__ = "su_co"
-    MaSuCo = Column(Integer, primary_key=True, index=True)
-    TenSuCo = Column(String)
-    MaCamera = Column(Integer, ForeignKey("camera.MaCamera"), nullable=True)
-    MaLuotVaoRa = Column(Integer, ForeignKey("thong_tin_vao_ra.MaLuotVaoRa"), nullable=True)
-    MaNhanVien = Column(Integer, ForeignKey("nhan_vien.MaNhanVien"), nullable=True)
-    HinhAnh = Column(String, nullable=True)
+    MaSuCo        = Column(Integer, primary_key=True, index=True)
+    TenSuCo       = Column(String)
+    MaCamera      = Column(Integer, ForeignKey("camera.MaCamera"), nullable=True)
+    MaLuotVaoRa   = Column(Integer, ForeignKey("thong_tin_vao_ra.MaLuotVaoRa"), nullable=True)
+    MaNhanVien    = Column(Integer, ForeignKey("nhan_vien.MaNhanVien"), nullable=True)
+    HinhAnh       = Column(String, nullable=True)
     TrangThaiXuLy = Column(String)
 
 Base.metadata.create_all(bind=engine)
+
+# ==========================================
+# 3. KHỞI TẠO DỮ LIỆU MẪU
+# ==========================================
+
+def init_db():
+    """Tạo dữ liệu mẫu: quyền, nhân viên, tài khoản, cổng, camera."""
+    db = SessionLocal()
+    try:
+        if db.query(QuyenHan).first():
+            return  # Đã có dữ liệu, bỏ qua
+
+        # Quyền hạn
+        q_bv = QuyenHan(Quyen="BAO_VE")
+        q_ql = QuyenHan(Quyen="QUAN_LY")
+        db.add_all([q_bv, q_ql])
+        db.commit()
+
+        # Nhân viên
+        nv1 = NhanVien(HoTen="Nguyễn Văn An", ChucVu="Bảo vệ", TrangThai="ACTIVE")
+        nv2 = NhanVien(HoTen="Trần Thị Bích", ChucVu="Quản lý", TrangThai="ACTIVE")
+        db.add_all([nv1, nv2])
+        db.commit()
+
+        # Tài khoản — 2 tài khoản để test
+        tk1 = TaiKhoan(username="baove",  pass_="123",  MaQuyenHan=q_bv.MaQuyenHan, MaNhanVien=nv1.MaNhanVien)
+        tk2 = TaiKhoan(username="quanly", pass_="123", MaQuyenHan=q_ql.MaQuyenHan, MaNhanVien=nv2.MaNhanVien)
+        db.add_all([tk1, tk2])
+        db.commit()
+
+        # Cổng & Camera
+        cong = Cong(TenCong="Cổng Chính")
+        db.add(cong)
+        db.commit()
+
+        cam_in  = Camera(TenCamera="Camera IN",  MaCong=cong.MaCong, TenHuongDi="IN")
+        cam_out = Camera(TenCamera="Camera OUT", MaCong=cong.MaCong, TenHuongDi="OUT")
+        db.add_all([cam_in, cam_out])
+        db.commit()
+
+        print("[DB] ✅ Dữ liệu mẫu đã được tạo")
+        print("[DB]    Tài khoản bảo vệ : baove  / baove123")
+        print("[DB]    Tài khoản quản lý: quanly / quanly123")
+    finally:
+        db.close()
+
 
 def get_db():
     db = SessionLocal()
@@ -110,37 +163,10 @@ def get_db():
     finally:
         db.close()
 
-def init_db():
-    db = SessionLocal()
-    if not db.query(QuyenHan).first():
-        q1 = QuyenHan(Quyen="BAO_VE")
-        q2 = QuyenHan(Quyen="QUAN_LY")
-        db.add_all([q1, q2])
-        db.commit()
-        
-        nv1 = NhanVien(HoTen="Bảo vệ 1", ChucVu="Bảo vệ", TrangThai="ACTIVE")
-        nv2 = NhanVien(HoTen="Quản lý 1", ChucVu="Quản lý", TrangThai="ACTIVE")
-        db.add_all([nv1, nv2])
-        db.commit()
-        
-        tk1 = TaiKhoan(username="baove", pass_="123", MaQuyenHan=q1.MaQuyenHan, MaNhanVien=nv1.MaNhanVien)
-        tk2 = TaiKhoan(username="quanly", pass_="123", MaQuyenHan=q2.MaQuyenHan, MaNhanVien=nv2.MaNhanVien)
-        db.add_all([tk1, tk2])
-        db.commit()
-        
-        c1 = Cong(TenCong="Cổng Chính")
-        db.add(c1)
-        db.commit()
-        
-        cam1 = Camera(TenCamera="Cam IN", MaCong=c1.MaCong, TenHuongDi="IN")
-        cam2 = Camera(TenCamera="Cam OUT", MaCong=c1.MaCong, TenHuongDi="OUT")
-        db.add_all([cam1, cam2])
-        db.commit()
-    db.close()
+# ==========================================
+# 4. PYDANTIC SCHEMAS
+# ==========================================
 
-# ==========================================
-# 2. Pydantic Models & Utils
-# ==========================================
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -148,355 +174,497 @@ class LoginRequest(BaseModel):
 class FixPlateRequest(BaseModel):
     correct_plate: str
 
-# ==========================================
-# 3. QUẢN LÝ TRẠNG THÁI CACHE & TRACKING
-# ==========================================
-ACTIVE_TRACKED_VEHICLES = {}
-COOLDOWN_TIME = 60
+class RegisterPlateRequest(BaseModel):
+    bien_so:          str
+    ma_loai:          int
+    ma_nhan_vien:     Optional[int] = None
 
-def upload_to_cloud(image_bgr, prefix="plate"):
-    filename = f"{prefix}_{uuid.uuid4().hex[:8]}.jpg"
-    path = os.path.join("public/images", filename)
-    cv2.imwrite(path, image_bgr)
-    return f"http://localhost:8000/public/images/{filename}"
+# ==========================================
+# 5. WEBSOCKET MANAGER
+# ==========================================
 
-def handle_vehicle_detection(plate_text: str, vehicle_type: str, db: Session, cam_label: str, crop_img):
-    current_time = time.time()
-    
-    if plate_text in ACTIVE_TRACKED_VEHICLES:
-        time_since_last_seen = current_time - ACTIVE_TRACKED_VEHICLES[plate_text]["last_seen"]
-        ACTIVE_TRACKED_VEHICLES[plate_text]["last_seen"] = current_time
-        if time_since_last_seen < COOLDOWN_TIME:
+class ConnectionManager:
+    """Quản lý kết nối WebSocket từ nhiều Dashboard client."""
+
+    def __init__(self):
+        self.frontends: List[WebSocket] = []  # Dashboard
+        self.edges: List[WebSocket]     = []  # Edge clients
+
+    async def connect_frontend(self, ws: WebSocket):
+        await ws.accept()
+        self.frontends.append(ws)
+        print(f"[WS] Dashboard kết nối. Tổng: {len(self.frontends)}")
+
+    async def connect_edge(self, ws: WebSocket):
+        await ws.accept()
+        self.edges.append(ws)
+        print(f"[WS] Edge client kết nối. Tổng: {len(self.edges)}")
+
+    def disconnect_frontend(self, ws: WebSocket):
+        if ws in self.frontends:
+            self.frontends.remove(ws)
+
+    def disconnect_edge(self, ws: WebSocket):
+        if ws in self.edges:
+            self.edges.remove(ws)
+
+    async def broadcast_to_frontends(self, message: dict):
+        """Gửi sự kiện real-time tới tất cả Dashboard đang kết nối."""
+        dead = []
+        for ws in self.frontends:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect_frontend(ws)
+
+manager = ConnectionManager()
+
+# ==========================================
+# 6. BUSINESS LOGIC — XỬ LÝ SỰ KIỆN XE
+# ==========================================
+
+# Cache chống trùng lặp sự kiện trong khoảng COOLDOWN giây
+_last_event: dict = {}   # {plate: {"time": float, "log_id": int}}
+COOLDOWN_SECS = 30
+
+
+def _save_image_from_b64(image_b64: str) -> str:
+    """Lưu ảnh Base64 vào thư mục public/images, trả về URL tương đối."""
+    if not image_b64:
+        return ""
+    try:
+        raw = base64.b64decode(image_b64.split(",")[-1])
+        filename = f"{uuid.uuid4().hex[:10]}.jpg"
+        path = os.path.join(BASE_DIR, "public", "images", filename)
+        with open(path, "wb") as f:
+            f.write(raw)
+        return f"/public/images/{filename}"
+    except Exception as e:
+        print(f"[IMG] Lỗi lưu ảnh: {e}")
+        return ""
+
+
+def process_vehicle_event(data: dict, db: Session) -> Optional[dict]:
+    """
+    Xử lý một sự kiện phát hiện xe từ edge_client.
+    Trả về dict event để broadcast, hoặc None nếu bị bỏ qua.
+    """
+    plate     = (data.get("plate") or "").strip().upper()
+    cam_label = data.get("cam_label", "IN").upper()
+    cam_id    = data.get("ma_camera")
+    vehicle   = data.get("vehicle", "Unknown")
+    image_b64 = data.get("image", "")
+    now       = datetime.now()
+
+    if not plate or len(plate) < 5:
+        return None
+
+    # Chống trùng lặp
+    if plate in _last_event:
+        if time.time() - _last_event[plate]["time"] < COOLDOWN_SECS:
             return None
-            
-    image_url = upload_to_cloud(crop_img)
-    cam = db.query(Camera).filter(Camera.TenHuongDi == cam_label).first()
-    cam_id = cam.MaCamera if cam else None
-    
-    is_error = len(plate_text) < 5 or "UNKNOWN" in plate_text
-    trang_thai = "CAN_KIEM_TRA" if is_error else "HOP_LE"
-    
+
+    img_url = _save_image_from_b64(image_b64)
+    is_error = "UNKNOWN" in plate
+
+    # Kiểm tra biển đã đăng ký
+    is_registered = db.query(PhuongTien).filter(PhuongTien.BienSoXe == plate).first() is not None
+    trang_thai = "CAN_KIEM_TRA" if is_error else ("HOP_LE" if is_registered else "CHUA_DANG_KY")
+
     if cam_label == "IN":
-        new_log = ThongTinVaoRa(
-            BienSoXe=plate_text,
-            ThoiGianVao=datetime.now(),
-            HinhAnhVao=image_url,
+        log = ThongTinVaoRa(
+            BienSoXe=plate,
+            ThoiGianVao=now,
+            HinhAnhVao=img_url,
             MaCamera=cam_id,
             TrangThai=trang_thai
         )
-        db.add(new_log)
+        db.add(log)
         db.commit()
-        db.refresh(new_log)
-        ACTIVE_TRACKED_VEHICLES[plate_text] = {"last_seen": current_time, "log_id": new_log.MaLuotVaoRa}
-        
+        db.refresh(log)
+
         if is_error:
-            su_co = SuCo(TenSuCo="AI_DOC_SAI", MaCamera=cam_id, MaLuotVaoRa=new_log.MaLuotVaoRa, HinhAnh=image_url, TrangThaiXuLy="CHUA_XU_LY")
-            db.add(su_co)
+            db.add(SuCo(TenSuCo="AI_DOC_SAI", MaCamera=cam_id,
+                        MaLuotVaoRa=log.MaLuotVaoRa, HinhAnh=img_url, TrangThaiXuLy="CHUA_XU_LY"))
             db.commit()
-            
-        return {"action": "ENTRY", "camera": cam_label, "plate": plate_text, "vehicle": vehicle_type, "time": str(new_log.ThoiGianVao), "image": image_url, "id": new_log.MaLuotVaoRa, "is_error": is_error}
-    
+
+        _last_event[plate] = {"time": time.time(), "log_id": log.MaLuotVaoRa}
+        return {
+            "action": "ENTRY", "cam_label": cam_label, "camera": cam_label,
+            "plate": plate, "vehicle": vehicle,
+            "time": now.isoformat(), "image": img_url,
+            "id": log.MaLuotVaoRa, "is_error": is_error,
+            "is_registered": is_registered
+        }
+
     elif cam_label == "OUT":
-        existing_log = db.query(ThongTinVaoRa).filter(
-            ThongTinVaoRa.BienSoXe == plate_text,
+        # Tìm lượt vào chưa có lượt ra
+        existing = db.query(ThongTinVaoRa).filter(
+            ThongTinVaoRa.BienSoXe == plate,
             ThongTinVaoRa.ThoiGianRa == None
         ).order_by(ThongTinVaoRa.ThoiGianVao.desc()).first()
-        
-        if existing_log and not is_error:
-            existing_log.ThoiGianRa = datetime.now()
-            existing_log.HinhAnhRa = image_url
+
+        if existing and not is_error:
+            existing.ThoiGianRa = now
+            existing.HinhAnhRa  = img_url
             db.commit()
-            db.refresh(existing_log)
-            ACTIVE_TRACKED_VEHICLES[plate_text] = {"last_seen": current_time, "log_id": existing_log.MaLuotVaoRa}
-            return {"action": "EXIT", "camera": cam_label, "plate": plate_text, "vehicle": vehicle_type, "time": str(existing_log.ThoiGianRa), "image": image_url, "id": existing_log.MaLuotVaoRa, "is_error": False}
+            db.refresh(existing)
+            _last_event[plate] = {"time": time.time(), "log_id": existing.MaLuotVaoRa}
+            return {
+                "action": "EXIT", "cam_label": cam_label, "camera": cam_label,
+                "plate": plate, "vehicle": vehicle,
+                "time": now.isoformat(), "image": img_url,
+                "id": existing.MaLuotVaoRa, "is_error": False,
+                "is_registered": is_registered
+            }
         else:
-            new_log = ThongTinVaoRa(
-                BienSoXe=plate_text,
-                ThoiGianRa=datetime.now(),
-                HinhAnhRa=image_url,
-                MaCamera=cam_id,
-                TrangThai="CAN_KIEM_TRA"
+            log = ThongTinVaoRa(
+                BienSoXe=plate, ThoiGianRa=now,
+                HinhAnhRa=img_url, MaCamera=cam_id, TrangThai="CAN_KIEM_TRA"
             )
-            db.add(new_log)
+            db.add(log)
             db.commit()
-            db.refresh(new_log)
-            ACTIVE_TRACKED_VEHICLES[plate_text] = {"last_seen": current_time, "log_id": new_log.MaLuotVaoRa}
-            
-            su_co = SuCo(TenSuCo="RA_KHONG_CO_LUOT_VAO" if not is_error else "AI_DOC_SAI", 
-                         MaCamera=cam_id, MaLuotVaoRa=new_log.MaLuotVaoRa, HinhAnh=image_url, TrangThaiXuLy="CHUA_XU_LY")
-            db.add(su_co)
+            db.refresh(log)
+
+            reason = "AI_DOC_SAI" if is_error else "RA_KHONG_CO_LUOT_VAO"
+            db.add(SuCo(TenSuCo=reason, MaCamera=cam_id,
+                        MaLuotVaoRa=log.MaLuotVaoRa, HinhAnh=img_url, TrangThaiXuLy="CHUA_XU_LY"))
             db.commit()
-            return {"action": "EXIT_WARNING", "camera": cam_label, "plate": plate_text, "vehicle": vehicle_type, "time": str(new_log.ThoiGianRa), "image": image_url, "id": new_log.MaLuotVaoRa, "is_error": True}
+            _last_event[plate] = {"time": time.time(), "log_id": log.MaLuotVaoRa}
+            return {
+                "action": "EXIT_WARNING", "cam_label": cam_label, "camera": cam_label,
+                "plate": plate, "vehicle": vehicle,
+                "time": now.isoformat(), "image": img_url,
+                "id": log.MaLuotVaoRa, "is_error": True,
+                "is_registered": is_registered
+            }
+
+    return None
 
 # ==========================================
-# 4. HỆ THỐNG AI BACKGROUND
+# 7. APP FASTAPI
 # ==========================================
-MODEL_PATH = os.path.join(BASE_DIR, "ver4.pt")
-DEVICE = '0' if torch.cuda.is_available() else 'cpu'
 
-PUBLIC_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "public"))
-VID_IN_PATH = os.path.join(PUBLIC_DIR, "video_out.mp4")
-VID_OUT_PATH = os.path.join(PUBLIC_DIR, "video_out.mp4")
-
-class AISystem:
-    def __init__(self):
-        self.running = False
-        self.ocr_queue = queue.Queue(maxsize=50)
-        self.raw_queue_in = queue.Queue(maxsize=30)
-        self.raw_queue_out = queue.Queue(maxsize=30)
-        self.tracking_data_in = {}
-        self.tracking_data_out = {}
-        
-    def start(self):
-        self.running = True
-        print("[INFO] Đang tải Model YOLO và OCR...")
-        self.model_in = YOLO(MODEL_PATH, task='detect')
-        self.model_out = YOLO(MODEL_PATH, task='detect')
-        self.ocr_model = PaddleOCR(lang="en")
-        
-        threading.Thread(target=self.video_reader_worker, args=(VID_IN_PATH, self.raw_queue_in), daemon=True).start()
-        threading.Thread(target=self.video_reader_worker, args=(VID_OUT_PATH, self.raw_queue_out), daemon=True).start()
-        
-        threading.Thread(target=self.ai_worker, args=(self.model_in, self.raw_queue_in, self.tracking_data_in, "IN"), daemon=True).start()
-        threading.Thread(target=self.ai_worker, args=(self.model_out, self.raw_queue_out, self.tracking_data_out, "OUT"), daemon=True).start()
-        
-        threading.Thread(target=self.ocr_worker, daemon=True).start()
-
-    def stop(self):
-        self.running = False
-
-    def video_reader_worker(self, video_path, raw_queue):
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"KHÔNG THỂ MỞ VIDEO TẠI: {video_path}")
-            return
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps == 0 or np.isnan(fps): fps = 30.0
-        frame_time = 1.0 / fps
-        
-        while self.running and cap.isOpened():
-            start_t = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            
-            if not raw_queue.full():
-                raw_queue.put(frame)
-            else:
-                time.sleep(0.01)
-                
-            elapsed = time.time() - start_t
-            if elapsed < frame_time:
-                time.sleep(frame_time - elapsed)
-        cap.release()
-
-    def get_sharpness(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        return cv2.Laplacian(gray, cv2.CV_64F).var()
-
-    def ocr_worker(self):
-        db = SessionLocal()
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        while self.running:
-            if not self.ocr_queue.empty():
-                item = self.ocr_queue.get()
-                if item is None: continue
-                cam_label, track_id, crop_img, tracking_data = item
-                
-                results = self.ocr_model.ocr(crop_img)
-                detected_text = ""
-                if results and results[0]:
-                    for line in results[0]:
-                        text = line[1][0]
-                        confidence = line[1][1]
-                        if confidence > 0.6: 
-                            detected_text += text
-                            
-                cleaned_text = re.sub(r'[^A-Z0-9]', '', detected_text.upper())
-                if len(cleaned_text) < 5:
-                    cleaned_text = "UNKNOWN"
-                
-                if track_id in tracking_data:
-                    tracking_data[track_id]['results'].append(cleaned_text)
-                    counter = Counter(tracking_data[track_id]['results'])
-                    best_plate, count = counter.most_common(1)[0]
-                    
-                    if count >= 3 and not tracking_data[track_id].get('saved', False):
-                        tracking_data[track_id]['saved'] = True
-                        v_type = tracking_data[track_id].get('vehicle_type', 'Unknown')
-                        print(f"[+] {cam_label} - CHỐT: {best_plate} ({v_type})")
-                        
-                        result = handle_vehicle_detection(best_plate, v_type, db, cam_label, crop_img)
-                        if result:
-                            loop.run_until_complete(manager.broadcast_log(result))
-            else:
-                time.sleep(0.01)
-        db.close()
-
-    def ai_worker(self, model, raw_queue, tracking_data, cam_label):
-        while self.running:
-            if raw_queue.empty():
-                time.sleep(0.01)
-                continue
-                
-            frame = raw_queue.get()
-            orig_h, orig_w = frame.shape[:2]
-            
-            results = model.track(frame, tracker="bytetrack.yaml", persist=True, verbose=False, device=DEVICE)
-            
-            if results[0].boxes.id is not None:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                track_ids = results[0].boxes.id.int().cpu().tolist()
-                classes = results[0].boxes.cls.int().cpu().tolist()
-                
-                vehicles = []
-                plates = []
-                
-                for box, track_id, cls in zip(boxes, track_ids, classes):
-                    if cls in [0, 1]:
-                        vehicles.append({'box': box, 'track_id': track_id, 'cls': cls})
-                    elif cls == 2:
-                        plates.append({'box': box, 'track_id': track_id})
-
-                for plate in plates:
-                    px1, py1, px2, py2 = map(int, plate['box'])
-                    p_track_id = plate['track_id']
-                    
-                    matched_vehicle_cls = 0
-                    for v in vehicles:
-                        vx1, vy1, vx2, vy2 = map(int, v['box'])
-                        if (px1 > vx1 - 5) and (py1 > vy1 - 5) and (px2 < vx2 + 5) and (py2 < vy2 + 5):
-                            matched_vehicle_cls = v['cls']
-                            break
-                            
-                    vehicle_type_str = "O to" if matched_vehicle_cls == 0 else "Xe may"
-                    
-                    if p_track_id not in tracking_data:
-                        tracking_data[p_track_id] = {'results': [], 'saved': False, 'last_seen': time.time(), 'last_ocr_time': 0, 'vehicle_type': vehicle_type_str}
-                    else:
-                        tracking_data[p_track_id]['last_seen'] = time.time()
-                        
-                    current_t = time.time()
-                    if current_t - tracking_data[p_track_id].get('last_ocr_time', 0) > 0.3:
-                        plate_crop = frame[max(0, py1-5):min(orig_h, py2+5), max(0, px1-5):min(orig_w, px2+5)]
-                        if plate_crop.size > 0 and plate_crop.shape[0] > 15 and plate_crop.shape[1] > 15:
-                            if self.ocr_queue.qsize() < 40:
-                                tracking_data[p_track_id]['last_ocr_time'] = current_t
-                                self.ocr_queue.put((cam_label, p_track_id, plate_crop, tracking_data))      
-
-            current_time = time.time()
-            to_delete = [tid for tid, data in tracking_data.items() if current_time - data['last_seen'] > 15]
-            for tid in to_delete:
-                del tracking_data[tid]
-
-# ==========================================
-# 5. FASTAPI WEBSOCKET MANAGER
-# ==========================================
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
-
-    async def broadcast_log(self, message: dict):
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except:
-                pass
-
-manager = ConnectionManager()
-ai_system = AISystem()
-
-# ==========================================
-# 6. LIFESPAN & ENDPOINTS
-# ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    ai_system.start()
     yield
-    ai_system.stop()
 
-app = FastAPI(title="Vehicle Monitoring API", lifespan=lifespan)
+app = FastAPI(title="Vehicle Monitoring — Central Server", version="2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.mount("/public", StaticFiles(directory="public"), name="public")
+# Serve ảnh tĩnh
+public_dir = os.path.join(BASE_DIR, "public")
+os.makedirs(public_dir, exist_ok=True)
+app.mount("/public", StaticFiles(directory=public_dir), name="public")
+
+# ==========================================
+# 8. WEBSOCKET ENDPOINTS
+# ==========================================
 
 @app.websocket("/ws/live_events")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+async def ws_frontend(websocket: WebSocket):
+    """Dashboard kết nối vào đây để nhận sự kiện real-time."""
+    await manager.connect_frontend(websocket)
     try:
         while True:
-            await websocket.receive_text()
+            await websocket.receive_text()  # Giữ kết nối sống
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect_frontend(websocket)
+
+
+@app.websocket("/ws/camera")
+async def ws_camera(websocket: WebSocket):
+    """Edge client kết nối vào đây để gửi kết quả AI."""
+    await manager.connect_edge(websocket)
+    db = SessionLocal()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = __import__('json').loads(raw)
+            except Exception:
+                continue
+
+            msg_type = data.get("type", "detection")
+
+            # Broadcast frame live ngay lập tức (không cần DB)
+            _cam_lbl = data.get("cam_label", "IN")
+            await manager.broadcast_to_frontends({
+                "type":      "live_frame",
+                "cam_label": _cam_lbl,
+                "camera":    _cam_lbl,   # alias cho Vue frontend
+                "image":     data.get("image", ""),
+                "plate":     data.get("plate", "---"),
+            })
+
+            # Chỉ xử lý DB khi là sự kiện phát hiện biển số thực
+            if msg_type == "detection" and data.get("plate"):
+                event = process_vehicle_event(data, db)
+                if event:
+                    print(f"[SERVER] {event['action']} — {event['plate']} ({event['cam_label']})")
+                    await manager.broadcast_to_frontends(event)
+
+    except WebSocketDisconnect:
+        manager.disconnect_edge(websocket)
+    except Exception as e:
+        print(f"[WS/camera] Lỗi: {e}")
+        manager.disconnect_edge(websocket)
+    finally:
+        db.close()
+
+# ==========================================
+# 9. REST API — AUTHENTICATION
+# ==========================================
 
 @app.post("/api/auth/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
-    acc = db.query(TaiKhoan).filter(TaiKhoan.username == req.username, TaiKhoan.pass_ == req.password).first()
+    acc = db.query(TaiKhoan).filter(
+        TaiKhoan.username == req.username,
+        TaiKhoan.pass_    == req.password
+    ).first()
     if not acc:
-        raise HTTPException(status_code=401, detail="Sai thông tin đăng nhập")
+        raise HTTPException(status_code=401, detail="Sai tên đăng nhập hoặc mật khẩu")
+
     quyen = db.query(QuyenHan).filter(QuyenHan.MaQuyenHan == acc.MaQuyenHan).first()
-    return {"token": "mock_token_" + acc.username, "role": quyen.Quyen, "username": acc.username}
+    nv    = db.query(NhanVien).filter(NhanVien.MaNhanVien == acc.MaNhanVien).first()
+
+    return {
+        "token":    f"token_{acc.username}_{int(time.time())}",
+        "role":     quyen.Quyen if quyen else "UNKNOWN",
+        "username": acc.username,
+        "ho_ten":   nv.HoTen if nv else acc.username,
+    }
+
+# ==========================================
+# 10. REST API — LOGS & HISTORY
+# ==========================================
 
 @app.get("/api/logs")
-def get_logs(db: Session = Depends(get_db)):
-    logs = db.query(ThongTinVaoRa).order_by(ThongTinVaoRa.ThoiGianVao.desc()).limit(50).all()
-    res = []
-    for log in logs:
-        res.append({
-            "id": log.MaLuotVaoRa,
-            "plate": log.BienSoXe,
-            "time_in": log.ThoiGianVao,
-            "time_out": log.ThoiGianRa,
-            "image_in": log.HinhAnhVao,
-            "image_out": log.HinhAnhRa,
-            "status": log.TrangThai
-        })
-    return res
+def get_logs(limit: int = 50, db: Session = Depends(get_db)):
+    """Lấy nhật ký vào ra gần nhất."""
+    logs = db.query(ThongTinVaoRa).order_by(
+        ThongTinVaoRa.ThoiGianVao.desc()
+    ).limit(limit).all()
+
+    return [{
+        "id":         log.MaLuotVaoRa,
+        "plate":      log.BienSoXe,
+        "vehicle":    log.MaLoaiPhuongTien,
+        "time_in":    log.ThoiGianVao.isoformat() if log.ThoiGianVao else None,
+        "time_out":   log.ThoiGianRa.isoformat()  if log.ThoiGianRa  else None,
+        "image_in":   log.HinhAnhVao,
+        "image_out":  log.HinhAnhRa,
+        "status":     log.TrangThai,
+        "cam_id":     log.MaCamera,
+    } for log in logs]
+
 
 @app.put("/api/logs/{log_id}/fix")
 def fix_log(log_id: int, req: FixPlateRequest, db: Session = Depends(get_db)):
+    """Bảo vệ sửa thủ công biển số bị đọc sai."""
     log = db.query(ThongTinVaoRa).filter(ThongTinVaoRa.MaLuotVaoRa == log_id).first()
     if not log:
-        raise HTTPException(status_code=404, detail="Not found")
-    log.BienSoXe = req.correct_plate
+        raise HTTPException(status_code=404, detail="Không tìm thấy bản ghi")
+
+    log.BienSoXe  = req.correct_plate.strip().upper()
     log.TrangThai = "HOP_LE"
-    
+
     su_co = db.query(SuCo).filter(SuCo.MaLuotVaoRa == log_id).first()
     if su_co:
         su_co.TrangThaiXuLy = "DA_XU_LY"
-        
+
     db.commit()
-    return {"success": True, "plate": log.BienSoXe}
+    return {"success": True, "plate": log.BienSoXe, "id": log_id}
+
+
+@app.get("/api/incidents")
+def get_incidents(status: Optional[str] = None, db: Session = Depends(get_db)):
+    """Lấy danh sách sự cố (có thể lọc theo trạng thái xử lý)."""
+    q = db.query(SuCo)
+    if status:
+        q = q.filter(SuCo.TrangThaiXuLy == status)
+    items = q.order_by(SuCo.MaSuCo.desc()).limit(50).all()
+    return [{
+        "id":           i.MaSuCo,
+        "ten_su_co":    i.TenSuCo,
+        "ma_luot":      i.MaLuotVaoRa,
+        "hinh_anh":     i.HinhAnh,
+        "trang_thai":   i.TrangThaiXuLy,
+    } for i in items]
+
+
+@app.put("/api/incidents/{su_co_id}/resolve")
+def resolve_incident(su_co_id: int, db: Session = Depends(get_db)):
+    """Đánh dấu sự cố đã được xử lý."""
+    sc = db.query(SuCo).filter(SuCo.MaSuCo == su_co_id).first()
+    if not sc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy sự cố")
+    sc.TrangThaiXuLy = "DA_XU_LY"
+    db.commit()
+    return {"success": True, "id": su_co_id}
+
+# ==========================================
+# 11. REST API — STATISTICS
+# ==========================================
 
 @app.get("/api/stats")
 def get_stats(db: Session = Depends(get_db)):
-    total_in = db.query(ThongTinVaoRa).filter(ThongTinVaoRa.ThoiGianVao != None).count()
-    total_out = db.query(ThongTinVaoRa).filter(ThongTinVaoRa.ThoiGianRa != None).count()
-    errors = db.query(SuCo).filter(SuCo.TrangThaiXuLy == "CHUA_XU_LY").count()
-    
+    """Thống kê tổng quan."""
+    today = datetime.now().date()
+
+    total_in        = db.query(ThongTinVaoRa).filter(ThongTinVaoRa.ThoiGianVao != None).count()
+    total_out       = db.query(ThongTinVaoRa).filter(ThongTinVaoRa.ThoiGianRa  != None).count()
+    in_today        = db.query(ThongTinVaoRa).filter(
+                          func.date(ThongTinVaoRa.ThoiGianVao) == today).count()
+    pending_in      = db.query(ThongTinVaoRa).filter(
+                          ThongTinVaoRa.ThoiGianRa == None,
+                          ThongTinVaoRa.ThoiGianVao != None).count()
+    pending_errors  = db.query(SuCo).filter(SuCo.TrangThaiXuLy == "CHUA_XU_LY").count()
+    total_incidents = db.query(SuCo).count()
+
     return {
-        "total_in": total_in,
-        "total_out": total_out,
-        "pending_errors": errors
+        "total_in":        total_in,
+        "total_out":       total_out,
+        "in_today":        in_today,
+        "vehicles_inside": pending_in,
+        "pending_errors":  pending_errors,
+        "total_incidents": total_incidents,
     }
 
+
+@app.get("/api/stats/hourly")
+def get_hourly_stats(db: Session = Depends(get_db)):
+    """Thống kê lượt vào theo giờ trong ngày hôm nay."""
+    today = datetime.now().date()
+    rows = db.query(
+        func.strftime('%H', ThongTinVaoRa.ThoiGianVao).label('hour'),
+        func.count(ThongTinVaoRa.MaLuotVaoRa).label('count')
+    ).filter(
+        func.date(ThongTinVaoRa.ThoiGianVao) == today
+    ).group_by('hour').all()
+
+    return [{"hour": int(r.hour), "count": r.count} for r in rows]
+
+# ==========================================
+# 12. REST API — PHƯƠNG TIỆN & TÀI KHOẢN
+# ==========================================
+
+@app.get("/api/vehicles")
+def get_vehicles(db: Session = Depends(get_db)):
+    """Danh sách xe đã đăng ký."""
+    items = db.query(PhuongTien).all()
+    return [{
+        "id":      v.MaPhuongTien,
+        "plate":   v.BienSoXe,
+        "type_id": v.MaLoaiPhuongTien,
+        "nv_id":   v.MaNhanVien,
+    } for v in items]
+
+
+@app.post("/api/vehicles")
+def register_vehicle(req: RegisterPlateRequest, db: Session = Depends(get_db)):
+    """Đăng ký biển số mới."""
+    existing = db.query(PhuongTien).filter(PhuongTien.BienSoXe == req.bien_so.upper()).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Biển số đã tồn tại")
+    v = PhuongTien(
+        BienSoXe=req.bien_so.upper(),
+        MaLoaiPhuongTien=req.ma_loai,
+        MaNhanVien=req.ma_nhan_vien
+    )
+    db.add(v)
+    db.commit()
+    db.refresh(v)
+    return {"success": True, "id": v.MaPhuongTien, "plate": v.BienSoXe}
+
+
+@app.get("/api/accounts")
+def get_accounts(db: Session = Depends(get_db)):
+    """Danh sách tài khoản (không trả về mật khẩu)."""
+    accs = db.query(TaiKhoan).all()
+    result = []
+    for acc in accs:
+        nv    = db.query(NhanVien).filter(NhanVien.MaNhanVien == acc.MaNhanVien).first()
+        quyen = db.query(QuyenHan).filter(QuyenHan.MaQuyenHan == acc.MaQuyenHan).first()
+        result.append({
+            "id":       acc.MaTaiKhoan,
+            "username": acc.username,
+            "ho_ten":   nv.HoTen if nv else "",
+            "role":     quyen.Quyen if quyen else "",
+        })
+    return result
+
+# ==========================================
+# 13. REST API — SETTINGS (CÀI ĐẶT AI)
+# ==========================================
+import json
+
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+
+def load_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return {"start": "00:00", "end": "23:59", "enabled": True}
+    with open(SETTINGS_FILE, "r") as f:
+        return json.load(f)
+
+@app.get("/api/settings")
+def get_sys_settings():
+    return load_settings()
+
+@app.post("/api/settings")
+async def update_sys_settings(req: dict):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(req, f)
+    return {"success": True, "settings": req}
+
+@app.get("/api/history")
+def get_history_paginated(
+    page: int = 1, 
+    limit: int = 20, 
+    plate: Optional[str] = None, 
+    db: Session = Depends(get_db)
+):
+    """API chính cho HistoryView.vue (Có phân trang và tìm kiếm)"""
+    query = db.query(ThongTinVaoRa)
+    
+    # Tìm kiếm theo biển số nếu có
+    if plate:
+        query = query.filter(ThongTinVaoRa.BienSoXe.contains(plate.upper()))
+    
+    # Tính toán phân trang
+    total = query.count()
+    pages = (total + limit - 1) // limit
+    
+    # Lấy dữ liệu theo offset
+    logs = query.order_by(ThongTinVaoRa.MaLuotVaoRa.desc())\
+                .offset((page - 1) * limit)\
+                .limit(limit).all()
+    
+    data = [{
+        "id":         log.MaLuotVaoRa,
+        "plate":      log.BienSoXe,
+        "time_in":    log.ThoiGianVao.isoformat() if log.ThoiGianVao else None,
+        "time_out":   log.ThoiGianRa.isoformat()  if log.ThoiGianRa  else None,
+        "image_in":   log.HinhAnhVao,
+        "image_out":  log.HinhAnhRa,
+        "status":     log.TrangThai,
+    } for log in logs]
+    
+    return {"data": data, "pages": pages}
+
+# ==========================================
+# ENTRY POINT
+# ==========================================
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
