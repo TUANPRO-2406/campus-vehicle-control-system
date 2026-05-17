@@ -26,7 +26,7 @@
           <span class="live-indicator">LIVE</span>
         </div>
         <div class="video-wrapper">
-          <video src="http://localhost:8000/public/video_out.mp4" autoplay loop muted class="video-stream"></video>
+          <img src="http://localhost:8001/video_feed/IN" class="video-stream" alt="Camera IN Stream" />
         </div>
         <div class="panel-footer" v-if="camInResult.plate !== '---'">
           <div class="latest-event success-bg">
@@ -49,7 +49,7 @@
           <span class="live-indicator">LIVE</span>
         </div>
         <div class="video-wrapper error-pulse">
-          <video src="http://localhost:8000/public/video_out.mp4" autoplay loop muted class="video-stream"></video>
+          <img src="http://localhost:8001/video_feed/OUT" class="video-stream" alt="Camera OUT Stream" />
         </div>
         <div class="panel-footer" v-if="camOutResult.plate !== '---'">
           <div class="latest-event success-bg">

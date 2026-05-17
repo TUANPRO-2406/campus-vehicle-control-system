@@ -38,6 +38,9 @@ parking_v2.db
 public/images/
 public/images/*.jpg
 public/images/*.png
+backend/public/images/
+backend/public/images/*.jpg
+backend/public/images/*.png
 # Chặn các file video demo nếu chúng quá nặng (>100MB)
 public/*.mp4
 *.mp4
