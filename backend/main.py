@@ -17,8 +17,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 IMAGE_DIR = "public/images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./parking_v2.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+DATABASE_URL = "postgresql://postgres:tuan@localhost:5432/vehicle_control_db"
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -62,6 +62,7 @@ class ThongTinVaoRa(Base):
     ThoiGianRa = Column(DateTime, nullable=True)
     HinhAnhRa = Column(String, nullable=True)
     MaCamera = Column(Integer, ForeignKey("camera.MaCamera"), nullable=True)
+    LoaiXe = Column(String, nullable=True)
     TrangThai = Column(String)
 
 class SuCo(Base):
@@ -74,12 +75,30 @@ class SuCo(Base):
 
 Base.metadata.create_all(bind=engine)
 
+def migrate_add_loai_xe_column():
+    """Thêm cột LoaiXe nếu chưa tồn tại (để hỗ trợ upgrade từ version cũ)"""
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        # Kiểm tra xem cột LoaiXe đã tồn tại trong bảng thong_tin_vao_ra chưa
+        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='thong_tin_vao_ra' AND column_name='LoaiXe'"))
+        if not result.fetchone():
+            # Nếu chưa tồn tại, thêm cột
+            db.execute(text("ALTER TABLE thong_tin_vao_ra ADD COLUMN LoaiXe VARCHAR NULL"))
+            db.commit()
+            logger.info("✓ Đã thêm cột LoaiXe vào bảng thong_tin_vao_ra")
+    except Exception as e:
+        logger.warning(f"Migration: {e}")
+    finally:
+        db.close()
+
 def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
 
 def init_static_data():
+    migrate_add_loai_xe_column()
     db = SessionLocal()
     if not db.query(QuyenHan).first():
         q1 = QuyenHan(Quyen="BAO_VE")
@@ -187,6 +206,7 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                 ThoiGianVao=datetime.now(),
                 HinhAnhVao=img_url,
                 MaCamera=payload.ma_camera,
+                LoaiXe=payload.vehicle,
                 TrangThai=trang_thai
             )
             db.add(new_log)
@@ -197,7 +217,7 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                 db.add(SuCo(TenSuCo="AI_DOC_SAI", MaLuotVaoRa=new_log.MaLuotVaoRa, HinhAnh=img_url, TrangThaiXuLy="CHUA_XU_LY"))
                 db.commit()
                 
-            broadcast_data = {"action": "ENTRY", "plate": payload.plate, "time": str(new_log.ThoiGianVao), "image": img_url, "status": trang_thai, "id": new_log.MaLuotVaoRa}
+            broadcast_data = {"action": "ENTRY", "cam_label": payload.cam_label, "plate": payload.plate, "vehicle": payload.vehicle, "time": str(new_log.ThoiGianVao), "image": img_url, "status": trang_thai, "id": new_log.MaLuotVaoRa}
 
         elif payload.cam_label == "OUT":
             # Kiểm tra xe trùng khớp luồng đã vào trong bãi chưa xe ra chưa có giờ ra
@@ -210,7 +230,7 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                 existing_log.ThoiGianRa = datetime.now()
                 existing_log.HinhAnhRa = img_url
                 db.commit()
-                broadcast_data = {"action": "EXIT", "plate": payload.plate, "time": str(existing_log.ThoiGianRa), "image": img_url, "status": "HOP_LE", "id": existing_log.MaLuotVaoRa}
+                broadcast_data = {"action": "EXIT", "cam_label": payload.cam_label, "plate": payload.plate, "vehicle": existing_log.LoaiXe, "time": str(existing_log.ThoiGianRa), "image": img_url, "status": "HOP_LE", "id": existing_log.MaLuotVaoRa}
             else:
                 # Cảnh báo bất thường: Ra không có lượt vào hoặc AI biên đọc sai dữ liệu
                 new_log = ThongTinVaoRa(
@@ -218,6 +238,7 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                     ThoiGianRa=datetime.now(),
                     HinhAnhRa=img_url,
                     MaCamera=payload.ma_camera,
+                    LoaiXe=payload.vehicle,
                     TrangThai="CAN_KIEM_TRA"
                 )
                 db.add(new_log)
@@ -227,7 +248,7 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                 su_co_type = "RA_KHONG_CO_LUOT_VAO" if not is_error else "AI_DOC_SAI"
                 db.add(SuCo(TenSuCo=su_co_type, MaLuotVaoRa=new_log.MaLuotVaoRa, HinhAnh=img_url, TrangThaiXuLy="CHUA_XU_LY"))
                 db.commit()
-                broadcast_data = {"action": "EXIT_WARNING", "plate": payload.plate, "time": str(new_log.ThoiGianRa), "image": img_url, "status": "CAN_KIEM_TRA", "id": new_log.MaLuotVaoRa}
+                broadcast_data = {"action": "EXIT_WARNING", "cam_label": payload.cam_label, "plate": payload.plate, "vehicle": payload.vehicle, "time": str(new_log.ThoiGianRa), "image": img_url, "status": "CAN_KIEM_TRA", "id": new_log.MaLuotVaoRa}
 
         # Phát tín hiệu lên màn hình giám sát VueJS ngay lập tức thông qua WebSocket
         await ws_manager.broadcast(broadcast_data)
@@ -269,6 +290,7 @@ def get_logs(db: Session = Depends(get_db)):
         "time_out": log.ThoiGianRa,
         "image_in": log.HinhAnhVao,
         "image_out": log.HinhAnhRa,
+        "vehicle": log.LoaiXe,
         "status": log.TrangThai
     } for log in logs]
 

@@ -1,33 +1,72 @@
 # ====================================================================
-# HƯỚNG DẪN CÀI ĐẶT MÔI TRƯỜNG ĐỒ ÁN (BẮT BUỘC DÙNG PYTHON 3.11)
+# PRODUCTION EDGE AI ALPR - REQUIREMENTS
+# Python 3.11 required
 # ====================================================================
-# Bước 1: Nếu máy có GPU NVIDIA (CUDA 12.1), cài PyTorch GPU trước:
-# pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 #
-# Bước 2: Cài đặt bộ đôi lõi toán học và nhận diện chữ Paddle:
-# pip install paddlepaddle==2.6.1
-# pip install paddleocr==2.7.3
+# INSTALLATION ORDER (IMPORTANT):
 #
-# Bước 3: Di chuyển vào thư mục chứa file này và chạy lệnh cài các gói còn lại:
-# pip install -r requirements.txt
+# Step 1: Install PyTorch with CUDA 12.1 (for GTX1650):
+#   pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+#       --index-url https://download.pytorch.org/whl/cu121
+#
+# Step 2: Install ONNX Runtime GPU (preferred OCR engine):
+#   pip install onnxruntime-gpu==1.19.2
+#
+# Step 3: Install PaddlePaddle GPU (OCR fallback):
+#   pip install paddlepaddle-gpu==2.6.2
+#   pip install paddleocr==2.7.3
+#
+# Step 4: Convert Paddle OCR model to ONNX (one-time):
+#   pip install paddle2onnx
+#   paddle2onnx --model_dir rec_model_v2 \
+#               --model_filename inference.pdmodel \
+#               --params_filename inference.pdiparams \
+#               --save_file rec_model.onnx \
+#               --opset_version 11 \
+#               --enable_onnx_checker True \
+#               --input_shape_dict "{'x':[-1,3,48,-1]}"
+#
+# Step 5: Install remaining dependencies:
+#   pip install -r requirements.txt
+#
+# Step 6: Export YOLO to TensorRT FP16 (one-time, on target GPU):
+#   yolo export model=ver4_yolov8n.pt format=engine half=True \
+#       imgsz=720,1280 device=0
+#
 # ====================================================================
 
-# --- HỆ THỐNG WEB SERVER & DATABASE (MAIN.PY) ---
+# --- WEB SERVER & STREAM ---
 fastapi==0.136.1
 uvicorn==0.47.0
 pydantic==2.13.4
+
+# --- DATABASE (main.py) ---
 SQLAlchemy==2.0.49
+psycopg2-binary==2.9.9
+
+# --- HTTP & NETWORKING ---
 requests==2.34.2
 websockets==12.0
 
-# --- XỬ LÝ ẢNH & TOÁN MA TRẬN CHỐNG XUNG ĐỘT ABI (EDGE.PY) ---
+# --- MQTT (optional, for event notifications) ---
+# Set MQTT_ENABLED=True in edge/config.py if using MQTT broker
+paho-mqtt==2.1.0
+
+# --- COMPUTER VISION ---
 numpy<2.0.0
 opencv-python==4.9.0.80
 
-# --- MÔ HÌNH NHẬN DIỆN VÀ THEO DÕI ĐỐI TƯỢNG (EDGE.PY) ---
+# --- YOLO + TRACKING ---
 ultralytics==8.4.51
 
-# --- CÁC THƯ VIỆN PHỤ TRỢ DỊCH MA TRẬN CHO PADDLEOCR ---
+# --- ONNX RUNTIME (OCR preferred engine - GPU) ---
+# Uncomment after: pip install onnxruntime-gpu==1.19.2 (separate step above)
+# onnxruntime-gpu==1.19.2
+
+# --- SYSTEM MONITORING ---
+psutil>=5.9.0
+
+# --- PADDLE OCR HELPERS ---
 shapely
 pyclipper
 scikit-image
