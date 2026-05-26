@@ -5,13 +5,38 @@ import os
 import sys
 import concurrent.futures
 
-os.environ["OMP_NUM_THREADS"] = "2"
-os.environ["OPENBLAS_NUM_THREADS"] = "2"
+# ==========================================
+# CẤU HÌNH GPU - PHẢI ĐẶT TRƯỚC KHI IMPORT PADDLE/TORCH
+# ==========================================
+# Giới hạn CPU threads tránh tranh chấp
+os.environ["OMP_NUM_THREADS"] = "1"      # Paddle yêu cầu =1 khi không dùng data parallel
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "2"
+
+# Chỉ dùng GPU 0
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# Paddle GPU flags - PHẢI đặt trước khi import paddle
+# Giới hạn Paddle dùng tối đa 500MB VRAM (500/4096 ≈ 12.2% của GTX 1650 4GB)
+os.environ["FLAGS_fraction_of_gpu_memory_to_use"] = "0.12"
+os.environ["FLAGS_initial_gpu_memory_in_mb"] = "100"
+os.environ["FLAGS_reallocate_gpu_memory_in_mb"] = "50"
+
+# Bật Paddle IR optimization và executor mới
 os.environ["FLAGS_enable_pir_api"] = "1"
-os.environ["FLAGS_use_mkldnn"]     = "1"
-os.environ["PADDLE_USE_MKLDNN"]    = "1"
-os.environ["FLAGS_new_executor"]   = "1"
+os.environ["FLAGS_new_executor"] = "1"
+
+# Tắt GLOG C++ warnings từ Paddle (angle classifier, cudnn info, v.v.)
+# GLOG_minloglevel: 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
+os.environ["GLOG_minloglevel"] = "3"
+os.environ["FLAGS_logtostderr"] = "0"
+
+# Tắt MKLDNN (CPU-only) để tránh xung đột với GPU mode
+# os.environ["FLAGS_use_mkldnn"]  = "0"   # Không cần khi dùng GPU
+# os.environ["PADDLE_USE_MKLDNN"] = "0"   # Không cần khi dùng GPU
+
+# Đảm bảo PyTorch và Paddle không block nhau (async CUDA ops)
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 
 import cv2
 import time
@@ -30,14 +55,28 @@ from paddleocr import PaddleOCR
 from fastapi.responses import StreamingResponse
 import uvicorn
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    force=True  # force=True ngăn uvicorn override logging config của chúng ta
+)
 logger = logging.getLogger("EdgeAI")
+
+# Suppress warning lặp lại từ ppocr (angle classifier) — áp dụng toàn cục từ đây
+class _SuppressAngleWarning(logging.Filter):
+    def filter(self, record):
+        return "angle classifier" not in record.getMessage()
+logging.getLogger("ppocr").setLevel(logging.ERROR)
+logging.getLogger("ppocr").addFilter(_SuppressAngleWarning())
 
 # ==========================================
 # CẤU HÌNH HỆ THỐNG BIÊN
 # ==========================================
-MODEL_PATH = "ver4_yolov8n.pt"
+MODEL_PATH = "ver4_yolov8n.engine"
+
+# YOLO chạy trên GPU '0' nếu CUDA khả dụng
 DEVICE = '0' if torch.cuda.is_available() else 'cpu'
+
 API_INGEST_URL = "http://localhost:8000/api/logs/ingest"
 
 CAMERAS = {
@@ -53,10 +92,25 @@ latest_frames = {"IN": None, "OUT": None}
 # Tạo ThreadPool để gửi API phi đồng bộ, tránh block luồng xử lý AI/OCR
 network_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
+# ==========================================
+# KIỂM TRA GPU STATUS KHI KHỞI ĐỘNG
+# ==========================================
+def log_gpu_status():
+    """Ghi log thông tin GPU để debug"""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**2
+        logger.info(f"[GPU] Phát hiện GPU: {gpu_name} | VRAM: {total_mem:.0f}MB")
+        logger.info(f"[GPU] YOLO sẽ chạy trên: device={DEVICE}")
+        logger.info(f"[GPU] PaddleOCR sẽ dùng tối đa ~500MB VRAM (12% của {total_mem:.0f}MB)")
+    else:
+        logger.warning("[GPU] Không phát hiện CUDA - hệ thống sẽ chạy trên CPU!")
+
+
 def apply_vn_plate_rules(text: str) -> str:
     text = text.upper().replace(" ", "").replace("-", "").replace(".", "")
     text = re.sub(r'[^A-Z0-9]', '', text)
-    if len(text) >= 7:
+    if len(text) >= 8:
         lst = list(text)
         corrections = {'8': 'B', '0': 'D', '1': 'A', '4': 'A', '6': 'G', '5': 'S'}
         if lst[2] in corrections: 
@@ -109,6 +163,7 @@ class StreamProcessor:
         self.ocr_queue = ocr_queue
         self.raw_queue = queue.Queue(maxsize=5) # Giảm maxsize để tránh tích tụ frame cũ gây delay stream
         self.tracking_data = {}
+        # YOLO khởi tạo với task='detect', sẽ dùng GPU khi gọi track()
         self.model = YOLO(MODEL_PATH, task='detect')
         
     def start(self):
@@ -152,6 +207,7 @@ class StreamProcessor:
             frame = self.raw_queue.get()
             orig_h, orig_w = frame.shape[:2]
             
+            # YOLO chạy trên GPU device='0'
             results = self.model.track(frame, tracker="bytetrack.yaml", persist=True, verbose=False, device=DEVICE)
             
             if results[0].boxes.id is not None:
@@ -277,23 +333,51 @@ def dispatch_payload(plate_text: str, td: dict, cam_label: str, cam_id: int):
     except Exception as e:
         logger.error(f"Lỗi phân phối dữ liệu: {e}")
 
-def ocr_worker(ocr_queue: queue.Queue):
-    logger.info("Đang khởi tạo lõi nhận diện ký tự PaddleOCR trên Edge (Đã bật MKLDNN)...")
-    # logging.getLogger("ppocr").setLevel(logging.ERROR)
+def ocr_worker(ocr_queue: queue.Queue, ready_event: threading.Event = None):
+    """
+    Worker chạy PaddleOCR trên GPU.
+    - Dùng device='gpu:0' để chạy inference trên GPU
+    - Giới hạn bộ nhớ GPU: 500MB (đã set qua FLAGS_fraction_of_gpu_memory_to_use=0.12)
+    - Tắt MKLDNN (CPU-only) để tránh xung đột với GPU context
+    - YOLO và Paddle cùng dùng GPU 0 nhưng khác CUDA streams → không conflict
+    """
+    logger.info("Đang khởi tạo lõi nhận diện ký tự PaddleOCR trên GPU...")
+
+    # Import paddle tại đây để đảm bảo env flags đã được set đầy đủ
+    try:
+        import paddle
+        paddle.device.set_device("gpu:0")
+        logger.info(f"[Paddle] Đã set device: {paddle.device.get_device()}")
+        logger.info(f"[Paddle] Compiled with CUDA: {paddle.is_compiled_with_cuda()}")
+    except Exception as e:
+        logger.warning(f"[Paddle] Không thể set GPU device: {e} - sẽ dùng CPU fallback")
+
+    # Khởi tạo PaddleOCR trên GPU
+    # Ghi chú quan trọng về conflict resolution:
+    # - YOLO (PyTorch) và Paddle đều dùng CUDA 0
+    # - PyTorch và Paddle dùng CUDA runtime riêng biệt → không block nhau
+    # - Paddle giới hạn 500MB VRAM qua FLAGS_fraction_of_gpu_memory_to_use
+    # - YOLO (YOLOv8n) dùng ~400-600MB VRAM
+    # - Tổng: ~1.0-1.1GB / 4GB VRAM → an toàn
     ocr_model = PaddleOCR(
         use_textline_orientation=False,
         lang="en",
-        device="cpu",
-        enable_mkldnn=True,
-        ir_optim=True,
+        device="gpu:0",           # Chạy OCR trên GPU thay vì CPU
+        enable_mkldnn=False,      # MKLDNN là CPU-only, phải tắt khi dùng GPU
+        ir_optim=True,            # Bật IR optimization để tăng tốc
         det_limit_side_len=320,
         det_db_thresh=0.45,
         det_db_box_thresh=0.6,
         use_mp=False,
         use_onnx=False,
-        show_log = False
+        show_log=False
     )
-    logger.info("PaddleOCR đã sẵn sàng hoạt động.")
+    logger.info("PaddleOCR đã sẵn sàng hoạt động trên GPU.")
+
+    # Báo hiệu cho main thread biết Paddle đã init xong, có thể khởi YOLO an toàn
+    if ready_event is not None:
+        ready_event.set()
+        logger.info("[Paddle] Đã báo hiệu sẵn sàng cho YOLO!")
     
     while True:
         try:
@@ -307,9 +391,9 @@ def ocr_worker(ocr_queue: queue.Queue):
         try:
             crop_img = align_plate(crop_img)
             t1= time.time()
-            ocr_results = ocr_model.ocr(crop_img)
+            ocr_results = ocr_model.ocr(crop_img, cls=False)  # cls=False: tắt angle classifier, không cần thiết cho biển số
             t2= time.time()
-            print(f"Thời gian xử lý OCR: {(t2 - t1)*1000:.2f} ms")
+            logger.info(f"[OCR-GPU] Thời gian xử lý: {(t2 - t1)*1000:.1f} ms")
             raw_text = ""
             
             if ocr_results and len(ocr_results) > 0 and ocr_results[0]:
@@ -371,11 +455,26 @@ async def video_feed(cam_label: str):
     return StreamingResponse(generate_frames(cam_label), media_type="multipart/x-mixed-replace; boundary=frame")
 
 if __name__ == "__main__":
+    log_gpu_status()
+
     ocr_q = queue.Queue(maxsize=20)
-    threading.Thread(target=ocr_worker, args=(ocr_q,), daemon=True).start()
-    
+
+    # Dùng Event để chờ PaddleOCR init GPU xong thực sự trước khi khởi YOLO
+    paddle_ready_event = threading.Event()
+
+    # Khởi động OCR worker trước để Paddle chiếm CUDA context trước YOLO
+    threading.Thread(target=ocr_worker, args=(ocr_q, paddle_ready_event), daemon=True).start()
+
+    # Chờ tín hiệu từ ocr_worker rằng PaddleOCR đã sẵn sàng (tối đa 120s)
+    logger.info("Đợi PaddleOCR khởi tạo GPU context (có thể mất 15-30s lần đầu)...")
+    ready = paddle_ready_event.wait(timeout=120)
+    if not ready:
+        logger.warning("PaddleOCR khởi tạo quá lâu, tiếp tục khởi động YOLO...")
+    else:
+        logger.info("PaddleOCR sẵn sàng! Bắt đầu khởi động YOLO cameras...")
+
     for label, config in CAMERAS.items():
         processor = StreamProcessor(label, config, ocr_q)
         processor.start()
-        
-    uvicorn.run(app_edge, host="0.0.0.0", port=8001, log_level="warning")
+
+    uvicorn.run(app_edge, host="0.0.0.0", port=8001, log_level="info")
