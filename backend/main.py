@@ -17,8 +17,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 IMAGE_DIR = "public/images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-DATABASE_URL = "postgresql://postgres:tuan@localhost:5432/vehicle_control_db"
-engine = create_engine(DATABASE_URL)
+SQLALCHEMY_DATABASE_URL = "sqlite:///./parking_v2.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -62,7 +62,6 @@ class ThongTinVaoRa(Base):
     ThoiGianRa = Column(DateTime, nullable=True)
     HinhAnhRa = Column(String, nullable=True)
     MaCamera = Column(Integer, ForeignKey("camera.MaCamera"), nullable=True)
-    LoaiXe = Column(String, nullable=True)
     TrangThai = Column(String)
 
 class SuCo(Base):
@@ -75,35 +74,22 @@ class SuCo(Base):
 
 Base.metadata.create_all(bind=engine)
 
-def migrate_add_loai_xe_column():
-    """Thêm cột LoaiXe nếu chưa tồn tại (để hỗ trợ upgrade từ version cũ)"""
-    from sqlalchemy import text
-    db = SessionLocal()
-    try:
-        # Kiểm tra xem cột LoaiXe đã tồn tại trong bảng thong_tin_vao_ra chưa
-        result = db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='thong_tin_vao_ra' AND column_name='LoaiXe'"))
-        if not result.fetchone():
-            # Nếu chưa tồn tại, thêm cột
-            db.execute(text("ALTER TABLE thong_tin_vao_ra ADD COLUMN LoaiXe VARCHAR NULL"))
-            db.commit()
-            logger.info("✓ Đã thêm cột LoaiXe vào bảng thong_tin_vao_ra")
-    except Exception as e:
-        logger.warning(f"Migration: {e}")
-    finally:
-        db.close()
-
 def get_db():
     db = SessionLocal()
-    try: yield db
-    finally: db.close()
+    try: 
+        yield db
+    finally: 
+        db.close()
 
 def init_static_data():
-    migrate_add_loai_xe_column()
     db = SessionLocal()
+    
+    # 1. Khởi tạo dữ liệu gốc nếu DB trống
     if not db.query(QuyenHan).first():
         q1 = QuyenHan(Quyen="BAO_VE")
         q2 = QuyenHan(Quyen="QUAN_LY")
-        db.add_all([q1, q2])
+        q3 = QuyenHan(Quyen="ADMIN")
+        db.add_all([q1, q2, q3])
         db.commit()
         
         nv1 = NhanVien(HoTen="Bảo vệ trực ca", ChucVu="Bảo vệ", TrangThai="ACTIVE")
@@ -113,10 +99,26 @@ def init_static_data():
         db.add_all([
             TaiKhoan(username="baove", pass_="123", MaQuyenHan=q1.MaQuyenHan),
             TaiKhoan(username="quanly", pass_="123", MaQuyenHan=q2.MaQuyenHan),
+            TaiKhoan(username="admin", pass_="admin123", MaQuyenHan=q3.MaQuyenHan),
             Camera(TenCamera="Camera Cổng Vào", TenHuongDi="IN"),
             Camera(TenCamera="Camera Cổng Ra", TenHuongDi="OUT")
         ])
         db.commit()
+
+    # 2. KIỂM TRA VÀ TẠO TÀI KHOẢN ADMIN TỐI CAO (Chạy độc lập)
+    admin_acc = db.query(TaiKhoan).filter(TaiKhoan.username == "admin").first()
+    if not admin_acc:
+        quyen_ql = db.query(QuyenHan).filter(QuyenHan.Quyen == "ADMIN").first()
+        if quyen_ql:
+            new_admin = TaiKhoan(
+                username="admin", 
+                pass_="admin123", # Mật khẩu của tài khoản Admin
+                MaQuyenHan=quyen_ql.MaQuyenHan
+            )
+            db.add(new_admin)
+            db.commit()
+            print("Đã khởi tạo thành công tài khoản: admin / admin123")
+            
     db.close()
 
 # ==========================================
@@ -158,7 +160,19 @@ class LoginRequest(BaseModel):
 
 class FixPlateRequest(BaseModel):
     correct_plate: str
-
+    
+class AccountCreateRequest(BaseModel):
+    username: str
+    password: str
+    role: str  # "BAO_VE", "QUAN_LY" hoặc "ADMIN"
+class AccountUpdateRequest(BaseModel):
+    username: str
+    password: str
+    role: str
+class AccountUpdateRequest(BaseModel):
+    username: str
+    password: str
+    role: str
 # ==========================================
 # FASTAPI LIFESPAN
 # ==========================================
@@ -206,7 +220,6 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                 ThoiGianVao=datetime.now(),
                 HinhAnhVao=img_url,
                 MaCamera=payload.ma_camera,
-                LoaiXe=payload.vehicle,
                 TrangThai=trang_thai
             )
             db.add(new_log)
@@ -217,7 +230,7 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                 db.add(SuCo(TenSuCo="AI_DOC_SAI", MaLuotVaoRa=new_log.MaLuotVaoRa, HinhAnh=img_url, TrangThaiXuLy="CHUA_XU_LY"))
                 db.commit()
                 
-            broadcast_data = {"action": "ENTRY", "cam_label": payload.cam_label, "plate": payload.plate, "vehicle": payload.vehicle, "time": str(new_log.ThoiGianVao), "image": img_url, "status": trang_thai, "id": new_log.MaLuotVaoRa}
+            broadcast_data = {"action": "ENTRY", "plate": payload.plate, "time": str(new_log.ThoiGianVao), "image": img_url, "status": trang_thai, "id": new_log.MaLuotVaoRa}
 
         elif payload.cam_label == "OUT":
             # Kiểm tra xe trùng khớp luồng đã vào trong bãi chưa xe ra chưa có giờ ra
@@ -230,7 +243,7 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                 existing_log.ThoiGianRa = datetime.now()
                 existing_log.HinhAnhRa = img_url
                 db.commit()
-                broadcast_data = {"action": "EXIT", "cam_label": payload.cam_label, "plate": payload.plate, "vehicle": existing_log.LoaiXe, "time": str(existing_log.ThoiGianRa), "image": img_url, "status": "HOP_LE", "id": existing_log.MaLuotVaoRa}
+                broadcast_data = {"action": "EXIT", "plate": payload.plate, "time": str(existing_log.ThoiGianRa), "image": img_url, "status": "HOP_LE", "id": existing_log.MaLuotVaoRa}
             else:
                 # Cảnh báo bất thường: Ra không có lượt vào hoặc AI biên đọc sai dữ liệu
                 new_log = ThongTinVaoRa(
@@ -238,7 +251,6 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                     ThoiGianRa=datetime.now(),
                     HinhAnhRa=img_url,
                     MaCamera=payload.ma_camera,
-                    LoaiXe=payload.vehicle,
                     TrangThai="CAN_KIEM_TRA"
                 )
                 db.add(new_log)
@@ -248,7 +260,7 @@ async def ingest_detection(payload: IngestPayload, db: Session = Depends(get_db)
                 su_co_type = "RA_KHONG_CO_LUOT_VAO" if not is_error else "AI_DOC_SAI"
                 db.add(SuCo(TenSuCo=su_co_type, MaLuotVaoRa=new_log.MaLuotVaoRa, HinhAnh=img_url, TrangThaiXuLy="CHUA_XU_LY"))
                 db.commit()
-                broadcast_data = {"action": "EXIT_WARNING", "cam_label": payload.cam_label, "plate": payload.plate, "vehicle": payload.vehicle, "time": str(new_log.ThoiGianRa), "image": img_url, "status": "CAN_KIEM_TRA", "id": new_log.MaLuotVaoRa}
+                broadcast_data = {"action": "EXIT_WARNING", "plate": payload.plate, "time": str(new_log.ThoiGianRa), "image": img_url, "status": "CAN_KIEM_TRA", "id": new_log.MaLuotVaoRa}
 
         # Phát tín hiệu lên màn hình giám sát VueJS ngay lập tức thông qua WebSocket
         await ws_manager.broadcast(broadcast_data)
@@ -271,51 +283,102 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
 
-@app.post("/api/auth/login")
-def login(req: LoginRequest, db: Session = Depends(get_db)):
-    acc = db.query(TaiKhoan).filter(TaiKhoan.username == req.username, TaiKhoan.pass_ == req.password).first()
-    if not acc:
-        raise HTTPException(status_code=401, detail="Sai thông tin tài khoản hoặc mật khẩu")
-    quyen = db.query(QuyenHan).filter(QuyenHan.MaQuyenHan == acc.MaQuyenHan).first()
-    return {"token": f"token_{acc.username}", "role": quyen.Quyen, "username": acc.username}
+# ==========================================
+# ĐỊNH NGHĨA CÁC PYDANTIC MODEL NHẬN DỮ LIỆU FRONTEND
+# ==========================================
+class AccountCreateRequest(BaseModel):
+    username: str
+    password: str
+    role: str
 
-@app.get("/api/logs")
-def get_logs(db: Session = Depends(get_db)):
-    """Truy vấn tối ưu lấy danh sách lượt xe mới nhất giới hạn trong 50 bản ghi"""
-    logs = db.query(ThongTinVaoRa).order_by(ThongTinVaoRa.MaLuotVaoRa.desc()).limit(50).all()
-    return [{
-        "id": log.MaLuotVaoRa,
-        "plate": log.BienSoXe,
-        "time_in": log.ThoiGianVao,
-        "time_out": log.ThoiGianRa,
-        "image_in": log.HinhAnhVao,
-        "image_out": log.HinhAnhRa,
-        "vehicle": log.LoaiXe,
-        "status": log.TrangThai
-    } for log in logs]
+class AccountUpdateRequest(BaseModel):
+    username: str
+    password: str
+    role: str
 
-@app.put("/api/logs/{log_id}/fix")
-def fix_log(log_id: int, req: FixPlateRequest, db: Session = Depends(get_db)):
-    """API sửa đổi biển số thủ công khi phát hiện sự cố hệ thống đọc sai"""
-    log = db.query(ThongTinVaoRa).filter(ThongTinVaoRa.MaLuotVaoRa == log_id).first()
-    if not log:
-        raise HTTPException(status_code=404, detail="Bản ghi không tồn tại")
-    log.BienSoXe = req.correct_plate
-    log.TrangThai = "HOP_LE"
+# ==========================================
+# NHÓM API QUẢN TRỊ TÀI KHOẢN (ADMIN ACCOUNTS)
+# ==========================================
+
+@app.get("/api/admin/accounts")
+def get_all_accounts(db: Session = Depends(get_db)):
+    """API lấy toàn bộ danh sách tài khoản kèm quyền hạn tương ứng"""
+    accounts = db.query(TaiKhoan, QuyenHan).join(QuyenHan, TaiKhoan.MaQuyenHan == QuyenHan.MaQuyenHan).all()
     
-    su_co = db.query(SuCo).filter(SuCo.MaLuotVaoRa == log_id).first()
-    if su_co:
-        su_co.TrangThaiXuLy = "DA_XU_LY"
-        
-    db.commit()
-    return {"success": True, "plate": log.BienSoXe}
+    # Định nghĩa mô tả chức năng tĩnh trực quan cho Frontend hiển thị
+    capabilities = {
+        "BAO_VE": "Giám sát xe vào/ra trực tiếp, sửa lỗi biển số thủ công khi AI đọc sai.",
+        "QUAN_LY": "Xem báo cáo thống kê chuyên sâu toàn diện của khuôn viên trường.",
+        "ADMIN": "Quyền hạn tối cao: Quản trị toàn bộ hệ thống, cấp phát và sửa đổi tài khoản mật khẩu."
+    }
+    
+    result = []
+    for acc, qh in accounts:
+        result.append({
+            "id": acc.MaTaiKhoan,
+            "username": acc.username,
+            "role": qh.Quyen,
+            "capability": capabilities.get(qh.Quyen, "Chưa phân quyền chi tiết")
+        })
+    return result
 
-@app.get("/api/stats")
-def get_stats(db: Session = Depends(get_db)):
-    total_in = db.query(ThongTinVaoRa).filter(ThongTinVaoRa.ThoiGianVao != None).count()
-    total_out = db.query(ThongTinVaoRa).filter(ThongTinVaoRa.ThoiGianRa != None).count()
-    errors = db.query(SuCo).filter(SuCo.TrangThaiXuLy == "CHUA_XU_LY").count()
-    return {"total_in": total_in, "total_out": total_out, "pending_errors": errors}
+@app.post("/api/admin/accounts")
+def create_new_account(req: AccountCreateRequest, db: Session = Depends(get_db)):
+    """API đăng ký cấp tài khoản mới"""
+    existing_user = db.query(TaiKhoan).filter(TaiKhoan.username == req.username).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Tên tài khoản này đã tồn tại trên hệ thống!")
+        
+    quyen = db.query(QuyenHan).filter(QuyenHan.Quyen == req.role).first()
+    if not quyen:
+        raise HTTPException(status_code=400, detail="Quyền hạn yêu cầu không hợp lệ!")
+        
+    new_acc = TaiKhoan(username=req.username, pass_=req.password, MaQuyenHan=quyen.MaQuyenHan)
+    db.add(new_acc)
+    db.commit()
+    return {"success": True, "message": "Cấp tài khoản mới thành công!"}
+
+@app.put("/api/admin/accounts/{account_id}")
+def update_account(account_id: int, req: AccountUpdateRequest, db: Session = Depends(get_db)):
+    """API cập nhật chỉnh sửa thông tin tài khoản và mật khẩu nhân sự"""
+    acc = db.query(TaiKhoan).filter(TaiKhoan.MaTaiKhoan == account_id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản cần cập nhật!")
+        
+    # Cơ chế bảo vệ an toàn: Không cho phép sửa tài khoản tên gốc 'admin' qua giao diện web
+    if acc.username == "admin":
+        raise HTTPException(status_code=400, detail="Không cho phép sửa tài khoản quản trị hệ thống gốc!")
+
+    # Kiểm tra xem tên đăng nhập mới có bị trùng lặp với người khác không
+    existing_user = db.query(TaiKhoan).filter(TaiKhoan.username == req.username, TaiKhoan.MaTaiKhoan != account_id).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Tên đăng nhập này đã được sử dụng bởi một tài khoản khác!")
+
+    quyen = db.query(QuyenHan).filter(QuyenHan.Quyen == req.role).first()
+    if not quyen:
+        raise HTTPException(status_code=400, detail="Quyền hạn yêu cầu không hợp lệ!")
+
+    # Tiến hành ghi đè dữ liệu mới
+    acc.username = req.username
+    acc.pass_ = req.password
+    acc.MaQuyenHan = quyen.MaQuyenHan
+    
+    db.commit()
+    return {"success": True, "message": "Cập nhật thông tin tài khoản thành công!"}
+
+@app.delete("/api/admin/accounts/{account_id}")
+def delete_account(account_id: int, db: Session = Depends(get_db)):
+    """API xóa bỏ quyền truy cập tài khoản"""
+    acc = db.query(TaiKhoan).filter(TaiKhoan.MaTaiKhoan == account_id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản cần xóa!")
+        
+    if acc.username == "quanly" or acc.username == "admin":
+        raise HTTPException(status_code=400, detail="Không cho phép xóa tài khoản mặc định cốt lõi của hệ thống!")
+        
+    db.delete(acc)
+    db.commit()
+    return {"success": True, "message": "Đã thu hồi tài khoản thành công!"}
 
 if __name__ == "__main__":
     import uvicorn
